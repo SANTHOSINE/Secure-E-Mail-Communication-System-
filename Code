@@ -1,0 +1,317 @@
+"""
+secure_email.py
+Secure E-Mail Communication System (simulated) using RSA + AES-GCM hybrid encryption.
+
+Requirements:
+    pip install pycryptodome
+
+How it works:
+- Users register -> RSA keypair generated and saved in DB (public key) and files (private key)
+- Send mail -> message encrypted with AES-GCM; AES key encrypted with recipient's RSA public key (PKCS1_OAEP)
+- Receive mail -> private key used to decrypt AES key -> decrypt AES-GCM ciphertext
+- Uses SQLite to store users and messages (for simulation)
+"""
+
+import os
+import sqlite3
+import base64
+import datetime
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP, AES
+from Crypto.Random import get_random_bytes
+from Crypto.Protocol.KDF import PBKDF2
+from Crypto.Cipher import AES as AES_cipher
+
+DB_FILENAME = "secure_mail.db"
+KEYS_DIR = "keys"  # to optionally export private keys (for demo)
+
+# ---------- Database setup ----------
+def init_db():
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    # users: username UNIQUE, public_key (PEM), private_key_path (for demo)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE,
+            public_key_pem TEXT,
+            private_key_path TEXT
+        )
+    ''')
+    # messages: store encrypted AES key, nonce, tag, ciphertext; subject + metadata
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sender TEXT,
+            recipient TEXT,
+            subject TEXT,
+            enc_aes_key TEXT,
+            nonce TEXT,
+            tag TEXT,
+            ciphertext TEXT,
+            timestamp TEXT,
+            read_flag INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# ---------- Key utilities ----------
+def generate_rsa_keypair(username, bits=2048):
+    """
+    Generate RSA keypair and return (private_pem, public_pem).
+    Also saves private key to KEYS_DIR/<username>_private.pem (demo).
+    """
+    key = RSA.generate(bits)
+    private_pem = key.export_key()
+    public_pem = key.publickey().export_key()
+
+    if not os.path.isdir(KEYS_DIR):
+        os.makedirs(KEYS_DIR, exist_ok=True)
+    priv_path = os.path.join(KEYS_DIR, f"{username}_private.pem")
+    with open(priv_path, "wb") as f:
+        f.write(private_pem)
+
+    return private_pem.decode('utf-8'), public_pem.decode('utf-8'), priv_path
+
+def load_public_key_from_pem(pem_str):
+    return RSA.import_key(pem_str.encode('utf-8'))
+
+def load_private_key_from_file(path):
+    with open(path, "rb") as f:
+        return RSA.import_key(f.read())
+
+# ---------- User management ----------
+def register_user(username):
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    # check if exists
+    c.execute("SELECT id FROM users WHERE username = ?", (username,))
+    if c.fetchone():
+        conn.close()
+        print(f"[!] Username '{username}' already exists.")
+        return False
+
+    priv_pem, pub_pem, priv_path = generate_rsa_keypair(username)
+    # store public pem and priv path in DB
+    c.execute("INSERT INTO users (username, public_key_pem, private_key_path) VALUES (?, ?, ?)",
+              (username, pub_pem, priv_path))
+    conn.commit()
+    conn.close()
+    print(f"[+] User '{username}' registered. Private key saved to '{priv_path}'. Keep it secret!")
+    return True
+
+def get_user_public_pem(username):
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    c.execute("SELECT public_key_pem FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+def get_user_private_path(username):
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    c.execute("SELECT private_key_path FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ---------- Hybrid encryption ----------
+def encrypt_message_for_recipient(plaintext: str, recipient_public_pem: str):
+    """
+    Hybrid encrypt:
+      - generate random AES-256 key
+      - encrypt plaintext with AES-GCM (returns nonce, tag, ciphertext)
+      - encrypt AES key with recipient's RSA public key (PKCS1_OAEP)
+    Return base64-encoded pieces (enc_aes_key_b64, nonce_b64, tag_b64, ciphertext_b64)
+    """
+    # 1. AES key
+    aes_key = get_random_bytes(32)  # AES-256
+
+    # 2. encrypt message with AES-GCM
+    cipher_aes = AES.new(aes_key, AES.MODE_GCM)
+    ciphertext, tag = cipher_aes.encrypt_and_digest(plaintext.encode('utf-8'))
+    nonce = cipher_aes.nonce
+
+    # 3. encrypt AES key with RSA public key
+    recipient_rsa = load_public_key_from_pem(recipient_public_pem)
+    rsa_cipher = PKCS1_OAEP.new(recipient_rsa)
+    enc_aes_key = rsa_cipher.encrypt(aes_key)
+
+    # base64 encode for safe DB storage
+    return (base64.b64encode(enc_aes_key).decode('utf-8'),
+            base64.b64encode(nonce).decode('utf-8'),
+            base64.b64encode(tag).decode('utf-8'),
+            base64.b64encode(ciphertext).decode('utf-8'))
+
+def decrypt_message_with_private(enc_aes_key_b64, nonce_b64, tag_b64, ciphertext_b64, recipient_private_key_path):
+    """
+    Reverse of encrypt_message_for_recipient.
+    - decrypt AES key using recipient private RSA key
+    - decrypt AES-GCM ciphertext
+    Returns plaintext string
+    """
+    # load and decode
+    enc_aes_key = base64.b64decode(enc_aes_key_b64)
+    nonce = base64.b64decode(nonce_b64)
+    tag = base64.b64decode(tag_b64)
+    ciphertext = base64.b64decode(ciphertext_b64)
+
+    # RSA decrypt AES key
+    priv_rsa = load_private_key_from_file(recipient_private_key_path)
+    rsa_cipher = PKCS1_OAEP.new(priv_rsa)
+    aes_key = rsa_cipher.decrypt(enc_aes_key)
+
+    # AES-GCM decrypt
+    cipher_aes = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+    plaintext = cipher_aes.decrypt_and_verify(ciphertext, tag)
+    return plaintext.decode('utf-8')
+
+# ---------- Messaging ----------
+def send_message(sender, recipient, subject, body):
+    # ensure recipient exists
+    pub_pem = get_user_public_pem(recipient)
+    if not pub_pem:
+        print(f"[!] Recipient '{recipient}' not found.")
+        return False
+
+    enc_aes_key_b64, nonce_b64, tag_b64, ciphertext_b64 = encrypt_message_for_recipient(body, pub_pem)
+
+    timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    c.execute('''
+        INSERT INTO messages (sender, recipient, subject, enc_aes_key, nonce, tag, ciphertext, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (sender, recipient, subject, enc_aes_key_b64, nonce_b64, tag_b64, ciphertext_b64, timestamp))
+    conn.commit()
+    conn.close()
+    print(f"[+] Message sent from '{sender}' to '{recipient}' (encrypted).")
+    return True
+
+def list_inbox(username):
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    c.execute("SELECT id, sender, subject, timestamp, read_flag FROM messages WHERE recipient = ? ORDER BY id DESC", (username,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def read_message(username, message_id):
+    """
+    Reads and decrypts a single message (if recipient matches).
+    Marks message as read.
+    """
+    conn = sqlite3.connect(DB_FILENAME)
+    c = conn.cursor()
+    c.execute("SELECT sender, recipient, subject, enc_aes_key, nonce, tag, ciphertext, timestamp FROM messages WHERE id = ?", (message_id,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        print("[!] Message not found.")
+        return None
+    sender, recipient, subject, enc_aes_key_b64, nonce_b64, tag_b64, ciphertext_b64, timestamp = row
+    if recipient != username:
+        conn.close()
+        print("[!] You are not the recipient of this message.")
+        return None
+
+    priv_path = get_user_private_path(username)
+    if not priv_path or not os.path.isfile(priv_path):
+        conn.close()
+        print("[!] Private key for user not found locally. Cannot decrypt.")
+        return None
+
+    try:
+        plaintext = decrypt_message_with_private(enc_aes_key_b64, nonce_b64, tag_b64, ciphertext_b64, priv_path)
+    except Exception as e:
+        conn.close()
+        print("[!] Decryption failed:", str(e))
+        return None
+
+    # mark as read
+    c.execute("UPDATE messages SET read_flag = 1 WHERE id = ?", (message_id,))
+    conn.commit()
+    conn.close()
+
+    return {
+        "id": message_id,
+        "sender": sender,
+        "subject": subject,
+        "body": plaintext,
+        "timestamp": timestamp
+    }
+
+# ---------- Demo CLI ----------
+def show_menu():
+    print("\n--- Secure E-Mail System (Simulated) ---")
+    print("1) Register user")
+    print("2) Send message")
+    print("3) List inbox")
+    print("4) Read message")
+    print("5) Exit")
+    print("----------------------------------------")
+
+def main():
+    init_db()
+    print("Welcome to Secure E-Mail Simulation (Hybrid RSA+AES-GCM)\n")
+    while True:
+        show_menu()
+        choice = input("Choose: ").strip()
+        if choice == "1":
+            username = input("Enter username to register: ").strip()
+            if username:
+                register_user(username)
+        elif choice == "2":
+            sender = input("Sender username: ").strip()
+            recipient = input("Recipient username: ").strip()
+            subject = input("Subject: ").strip()
+            print("Enter message (end with a blank line):")
+            lines = []
+            while True:
+                line = input()
+                if line == "":
+                    break
+                lines.append(line)
+            body = "\n".join(lines)
+            # Basic checks
+            if not get_user_public_pem(sender):
+                print(f"[!] Sender '{sender}' not registered. Register them first.")
+                continue
+            send_message(sender, recipient, subject, body)
+        elif choice == "3":
+            username = input("List inbox for user: ").strip()
+            msgs = list_inbox(username)
+            if not msgs:
+                print("(no messages)")
+            else:
+                print(f"Messages for {username}:")
+                for mid, sender, subj, ts, read_flag in msgs:
+                    status = "Read" if read_flag else "Unread"
+                    print(f"ID:{mid} | From:{sender} | Subject:{subj} | Time:{ts} | {status}")
+        elif choice == "4":
+            username = input("Username (recipient): ").strip()
+            mid = input("Message ID to read: ").strip()
+            try:
+                mid = int(mid)
+            except:
+                print("[!] Invalid message ID")
+                continue
+            msg = read_message(username, mid)
+            if msg:
+                print("\n----- MESSAGE -----")
+                print(f"From   : {msg['sender']}")
+                print(f"Subject: {msg['subject']}")
+                print(f"Time   : {msg['timestamp']}")
+                print("Body:")
+                print(msg['body'])
+                print("-------------------")
+        elif choice == "5":
+            print("Bye!")
+            break
+        else:
+            print("Invalid choice. Try again.")
+
+if _name_ == "_main_":
+    main()
